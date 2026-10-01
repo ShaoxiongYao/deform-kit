@@ -1,0 +1,42 @@
+[project]
+name = "deformkit"
+version = "0.1.0"
+description = "A small, extensible GPU deformable-body simulation kit built on NVIDIA Warp."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Shaoxiong Yao", email = "syao16@illinois.edu" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.6",
+    "warp-lang>=1.17.0",
+]
+
+[project.optional-dependencies]
+viz = [
+    "pyglet>=2.1.16",
+    "usd-core>=26.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
