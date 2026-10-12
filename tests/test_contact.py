@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 import deformkit as dk
-from deformkit.utils.mesh import box_tet_mesh, rotate
+from deformkit.utils.mesh import box_tet_mesh, remove_unused_vertices, rotate
 
 
 def settle(world, steps):
@@ -80,10 +80,9 @@ def test_vertex_triangle_detection_inside_mesh():
     c = world.collision_system.detect(world, margin=1e-3)
     n = c.count()
     assert n == 2  # the far particle is ignored
-    gap = c.data.gap.numpy()[:n]
-    normal = c.data.normal.numpy()[:n]
-    vertex = c.data.vertex.numpy()[:n]
-    by_vertex = dict(zip(vertex - world.objects[1].vertex_start, zip(gap, normal)))
+    rec = c.numpy()
+    vertex = rec["nodes"][:, 0]
+    by_vertex = dict(zip(vertex - world.objects[1].vertex_start, zip(rec["gap"], rec["normal"])))
     np.testing.assert_allclose(by_vertex[0][0], -0.05, atol=1e-5)  # inside: negative gap
     np.testing.assert_allclose(by_vertex[1][0], 0.0005, atol=1e-5)
     for _, nrm in by_vertex.values():
@@ -180,10 +179,10 @@ def test_mesh_contact_is_symmetric_in_object_order():
 
 def test_both_contact_directions_are_detected():
     world, objs = overlapping_cubes()
-    _, n = contact_forces(world)
-    c = world.contacts if world.contacts is not None else world.collision_system.contacts
-    vertex = c.data.vertex.numpy()[:n]
-    owner = world.object_ids.numpy()[vertex]
+    contact_forces(world)
+    rec = world.collision_system.contacts.numpy()
+    vertex_triangle = (rec["weights"][:, 0] == 1.0) & (rec["nodes"][:, 1] >= 0)
+    owner = world.object_ids.numpy()[rec["nodes"][vertex_triangle, 0]]
     assert set(owner) == {objs[0].object_id, objs[1].object_id}  # V_A -> F_B and V_B -> F_A
 
 
@@ -214,11 +213,142 @@ def test_penalty_damping_is_never_attractive(damping):
         assert normal_force(100.0) == 0.0  # fast separation: clamped, never pulls back
 
 
-def test_contact_buffer_overflow_raises():
+def test_contact_buffer_grows_instead_of_dropping():
     world = dk.World()
     world.add_plane()
     world.add(dk.ParticleSystem(np.zeros((5, 3))))
     world.finalize()
     world.collision_system.contacts = dk.Contacts(capacity=2, device=world.device)
+    c = world.collision_system.detect(world, margin=1e-3)
+    assert c.capacity >= 5
+    assert c.count() == 5
+
+
+def test_contact_count_raises_if_records_were_dropped():
+    c = dk.Contacts(capacity=2, device=dk.World().device)
+    c.data.count.fill_(3)
     with pytest.raises(RuntimeError, match="overflow"):
-        world.collision_system.detect(world, margin=1e-3).count()
+        c.count()
+
+
+def crossed_bars(gap, edge_edge=True, velocity=0.0):
+    """Two square bars at right angles, turned 45deg so only an edge of each faces the other.
+
+    Their nodes sit 3 cm away from the crossing point, so vertex-triangle
+    contact cannot see the crossing until the bars are deep inside each other.
+    """
+    half = 0.03 * np.sqrt(2)  # half-diagonal of the 6 cm square section
+    va, ta = box_tet_mesh((-0.3, -0.03, -0.03), (0.3, 0.03, 0.03), (10, 1, 1))
+    va = rotate(va, (1, 0, 0), np.pi / 4, center=(0, 0, 0))  # top edge along x at y = +half
+    vb, tb = box_tet_mesh((-0.03, -0.03, -0.3), (0.03, 0.03, 0.3), (1, 1, 10))
+    vb = rotate(vb, (0, 0, 1), np.pi / 4, center=(0, 0, 0))  # bottom edge along z at y = -half
+    vb = vb + np.array([0.03, 2 * half + gap, 0.03], np.float32)
+
+    world = dk.World(
+        dt=1e-4,
+        gravity=(0, 0, 0),
+        contact_model=dk.PenaltyContact(stiffness=2e4, damping=2.0, thickness=2e-3),
+        collision_system=dk.CollisionSystem(edge_edge=edge_edge),
+    )
+    material = dk.StableNeoHookean(1e6, 0.3)
+    a = world.add(dk.TetFEM(va, ta, material, density=500))
+    b = world.add(dk.TetFEM(vb, tb, material, density=500, velocities=np.tile([0, -velocity, 0], (len(vb), 1))))
+    # the two mesh edges that cross, at (x, z) = (0.03, 0): A's from x = 0 to 0.06, B's from z = -0.03 to 0.03
+    top_a = np.isclose(va[:, 1], va[:, 1].max(), atol=1e-6)
+    bottom_b = np.isclose(vb[:, 1], vb[:, 1].min(), atol=1e-6)
+    edge_a = np.where(top_a & (np.isclose(va[:, 0], 0.0, atol=1e-6) | np.isclose(va[:, 0], 0.06, atol=1e-6)))[0]
+    edge_b = np.where(bottom_b & (np.isclose(np.abs(vb[:, 2]), 0.03, atol=1e-6)))[0]
+    assert len(edge_a) == 2 and len(edge_b) == 2
+    return world, a, b, edge_a, edge_b
+
+
+def test_edge_edge_detection():
+    world, a, b, _, _ = crossed_bars(gap=5e-4)
+    world.finalize()
+    rec = world.collision_system.detect(world, margin=2e-3).numpy()
+    assert len(rec["gap"]) == 1  # exactly one record for the crossing pair, not one per side
+    np.testing.assert_allclose(rec["gap"][0], 5e-4, atol=1e-5)
+    np.testing.assert_allclose(np.abs(rec["normal"][0]), [0, 1, 0], atol=1e-4)
+    np.testing.assert_allclose(rec["weights"][0].sum(), 0.0, atol=1e-6)
+
+    world, *_ = crossed_bars(gap=5e-4, edge_edge=False)
+    world.finalize()
+    assert world.collision_system.detect(world, margin=2e-3).count() == 0  # invisible to vertex-triangle
+
+
+def test_edge_edge_detection_after_crossing():
+    world, a, b, _, _ = crossed_bars(gap=-5e-4)  # edges have passed through each other
+    world.finalize()
+    rec = world.collision_system.detect(world, margin=2e-3).numpy()
+    assert len(rec["gap"]) == 1
+    np.testing.assert_allclose(rec["gap"][0], -5e-4, atol=1e-5)  # signed: overlapping
+    # the force pushes side A's edge back out of B, whichever bar side A is
+    side_a = world.object_ids.numpy()[rec["nodes"][0, 0]]
+    expected = [0, -1, 0] if side_a == a.object_id else [0, 1, 0]
+    np.testing.assert_allclose(rec["normal"][0], expected, atol=1e-4)
+
+
+@pytest.mark.parametrize("edge_edge", [True, False])
+def test_edge_edge_stops_crossing_bars(edge_edge):
+    # slow enough that one penalty contact stops the bar within its 2 mm thickness;
+    # edge-edge only acts within that band, so faster crossings would tunnel
+    world, a, b, edge_a, edge_b = crossed_bars(gap=0.01, edge_edge=edge_edge, velocity=0.3)
+    separation = np.inf  # height of B's edge above A's edge at the crossing (both edge midpoints)
+    for _ in range(1000):
+        world.step()
+        y_a = a.state.x.numpy()[edge_a, 1].mean()
+        y_b = b.state.x.numpy()[edge_b, 1].mean()
+        separation = min(separation, y_b - y_a)
+    if edge_edge:
+        assert separation > 0.0  # held apart within the contact thickness
+    else:
+        assert separation < -0.01  # the edges pass straight through each other
+
+
+def u_shape(self_contact):
+    """A soft U (two 3 cm arms on a base, 6 cm apart) with its arms thrown toward each other."""
+    res = (4, 4, 1)
+    v, t = box_tet_mesh((0, 0, 0), (0.12, 0.12, 0.03), res)
+    cell = np.repeat(np.arange(res[0] * res[1]), 5)  # 5 tets per cell, cells ordered x-fastest
+    i, j = cell % res[0], cell // res[0]
+    keep = ~((i >= 1) & (i <= 2) & (j >= 1))  # carve the slot between the arms
+    v, t = remove_unused_vertices(v, t[keep])
+
+    arm = v[:, 1] > 0.035
+    left, right = arm & (v[:, 0] < 0.035), arm & (v[:, 0] > 0.085)
+    vel = np.zeros_like(v)
+    vel[left, 0], vel[right, 0] = 1.5, -1.5
+    world = dk.World(
+        dt=1e-4,
+        gravity=(0, 0, 0),
+        contact_model=dk.PenaltyContact(stiffness=1e4, damping=1.0, thickness=2e-3),
+        collision_system=dk.CollisionSystem(self_contact=self_contact),
+    )
+    body = world.add(dk.TetFEM(v, t, dk.StableNeoHookean(5e4, 0.3), density=500, velocities=vel))
+    # inner faces of the slot: left arm's right face and right arm's left face, above the base
+    inner_left = np.where(arm & np.isclose(v[:, 0], 0.03))[0]
+    inner_right = np.where(arm & np.isclose(v[:, 0], 0.09))[0]
+    return world, body, inner_left, inner_right
+
+
+@pytest.mark.parametrize("self_contact", [True, False])
+def test_self_contact_keeps_u_arms_apart(self_contact):
+    world, body, inner_left, inner_right = u_shape(self_contact)
+    gap = np.inf
+    for _ in range(1500):
+        world.step()
+        x = body.state.x.numpy()
+        gap = min(gap, x[inner_right, 0].min() - x[inner_left, 0].max())
+    if self_contact:
+        assert gap > 0.0
+    else:
+        assert gap < -0.005  # the arms pass through each other
+
+
+def test_self_contact_has_no_false_positives_at_rest():
+    v, t = box_tet_mesh((0, 0, 0), (0.1, 0.1, 0.1), 4)
+    for obj in (dk.TetFEM(v, t), dk.SpringMesh(v, [[0, 1]], triangles=dk.TetFEM(v, t).collision_shape.triangles)):
+        world = dk.World(collision_system=dk.CollisionSystem(self_contact=True))
+        world.add(obj)
+        world.finalize()
+        assert world.collision_system.detect(world, margin=2e-3).count() == 0

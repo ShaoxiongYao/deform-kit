@@ -1,7 +1,8 @@
 """A small soft cube lands on a larger one, tips over its edge, and falls to the ground.
 
-Contact between the cubes is vertex-triangle penalty contact in both directions.
-There is no friction, so nothing holds the upper cube in place.
+Contact between the cubes is vertex-triangle and edge-edge penalty contact.
+Friction is left off (the default) so nothing holds the upper cube in place;
+see soft_stack.py for the same kind of scene with friction.
 
     uv run examples/two_soft_objects.py [--viewer] [--usd out.usd]
 """
@@ -36,11 +37,10 @@ min_gap = np.inf
 
 def report(world, frame):
     global min_gap
-    c = world.contacts
-    n = c.count()
-    between = c.data.other.numpy()[:n, 0] >= 0  # contacts against a mesh, not an obstacle
+    rec = world.contacts.numpy()
+    between = rec["nodes"][:, 1] >= 0  # contacts against another object, not an obstacle
     if between.any():
-        min_gap = min(min_gap, c.data.gap.numpy()[:n][between].min())
+        min_gap = min(min_gap, rec["gap"][between].min())
     if frame % 30 == 29:
         com = small.state.x.numpy().mean(0)
         print(f"t={world.time:5.2f}s  small cube com={com.round(3)}  object-object contacts={int(between.sum())}")

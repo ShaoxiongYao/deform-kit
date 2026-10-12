@@ -1,28 +1,29 @@
 # DeformKit
 
-A small research codebase for GPU deformable-body simulation with simple multi-object contact, built on
+A small research codebase for GPU deformable-body simulation with multi-object contact, built on
 [NVIDIA Warp](https://github.com/NVIDIA/warp).
 
-It is deliberately minimal: semi-implicit Euler, penalty contact, no friction. The point is a set of clean
-abstractions that FEM variants, cloth, ropes, implicit solvers and better contact models can grow into.
+It is deliberately minimal: semi-implicit Euler, penalty contact with Coulomb friction, ~1,600 lines. The
+point is a set of clean abstractions that FEM variants, cloth, ropes, implicit solvers and other contact
+models can grow into.
 
 ## Quick start
 
 ```bash
 uv sync                      # core: warp-lang + numpy
-uv run pytest                # 21 tests, ~5 s on a GPU
-uv run examples/soft_cube_drop.py
+uv run pytest                # 52 tests, ~25 s on a GPU
+uv run examples/soft_stack.py
 
 uv sync --extra viz          # optional: OpenGL viewer (pyglet) and USD export (usd-core)
-uv run examples/two_soft_objects.py --viewer
-uv run examples/two_soft_objects.py --usd two_cubes.usd
+uv run examples/soft_stack.py --viewer
+uv run examples/soft_stack.py --usd stack.usd
 ```
 
 ```python
 import deformkit as dk
 from deformkit.utils.mesh import box_tet_mesh
 
-world = dk.World(dt=2e-4, gravity=(0.0, -9.81, 0.0))
+world = dk.World(dt=2e-4, contact_model=dk.PenaltyContact(stiffness=2e4, damping=5.0, friction=0.5))
 world.add_plane(normal=(0, 1, 0), offset=0.0)
 
 vertices, tets = box_tet_mesh((-0.1, 0.3, -0.1), (0.1, 0.5, 0.1), resolution=5)
@@ -32,6 +33,14 @@ for _ in range(5000):
     world.step()
 print(cube.state.x.numpy().mean(axis=0))
 ```
+
+| Example                 | Shows                                                          |
+|-------------------------|----------------------------------------------------------------|
+| `particles_on_plane.py` | particles vs. a sphere and a plane                             |
+| `spring_cube_drop.py`   | mass-spring cube with a triangle collision surface             |
+| `soft_cube_drop.py`     | Neo-Hookean FEM cube                                           |
+| `two_soft_objects.py`   | frictionless cube-on-cube contact: the upper cube slides off   |
+| `soft_stack.py`         | the same kind of scene with friction: an off-center tower holds |
 
 ## Design
 
@@ -86,33 +95,62 @@ This is **not** the classic `−μ log J + λ/2 (log J)²` Neo-Hookean. It has n
 for inverted elements and needs no SVD. λ is shifted by μ so that `StableNeoHookean(E, ν)` matches linear
 elasticity at small strain.
 
-### Collision and contact
+### Contact records
 
-Detection writes a fixed-capacity `Contacts` buffer on the GPU. Each record pairs one node with an "other
-side" of up to three nodes plus barycentric weights, or `-1` for a static obstacle. It also stores a
-normal and a signed `gap` (distance minus radii, negative when overlapping).
+Detection fills a GPU `Contacts` buffer. Every primitive writes the same record: up to four nodes with
+signed weights, where the relative position of the two sides is `Σ wₖ xₖ`. Positive weights form side A
+and negative weights side B; `-1` marks an unused slot, such as a static obstacle.
 
-| Primitive          | Collides                                              |
-|--------------------|-------------------------------------------------------|
-| `particle_plane`   | collision vertices vs. static half-spaces             |
-| `particle_sphere`  | collision vertices vs. static spheres                 |
-| `vertex_triangle`  | collision vertices vs. other objects' closed meshes (Warp BVH query with inside/outside sign) |
+| Primitive         | Nodes            | Weights                     |
+|-------------------|------------------|-----------------------------|
+| vertex–obstacle   | `(p, -, -, -)`   | `(1, 0, 0, 0)`              |
+| vertex–triangle   | `(p, a, b, c)`   | `(1, −w_a, −w_b, −w_c)`     |
+| edge–edge         | `(a₀, a₁, b₀, b₁)` | `(1−s, s, −(1−t), −t)`    |
 
-Pair policy: each object's collision vertices are tested against every *other* object's mesh, so mesh–mesh
-contact is symmetric (vertices of A against faces of B, and vertices of B against faces of A). Pairs within
-the same object are skipped because self-contact is not supported.
+Each record also stores a `normal` (the direction side A is pushed) and a signed `gap` (distance minus
+radii, negative when overlapping). A contact model maps a record to a force `f` and applies `wₖ f` to node
+k. The weights sum to zero, so linear momentum is conserved by construction. `Contacts.numpy()` returns
+the records for inspection.
 
-Cost: planes and spheres are tested against every vertex, O(V × obstacles). Mesh contact goes through one
-BVH per object (`wp.Mesh`, refit every step), so it costs O(V × meshes × log F) rather than brute-force
-O(V × F). All candidate generation lives in `vertex_triangle.py`; contact models only see the resulting
-buffer. Each vertex yields at most one contact per obstacle, so the buffer is sized exactly, and
-`Contacts.count()` raises if it ever overflows.
+### Collision detection
 
-`PenaltyContact(stiffness, damping, thickness)` turns each record into
-`f = max(0, k·d − c·v_n)·n` with `d = thickness − gap`. Here `v_n < 0` means approaching, so damping adds
-repulsion. While separating it only reduces the force, and the clamp keeps it from ever attracting. The
-vertex gets `+f` and the triangle nodes get `−w_j·f`. Since `Σw_j = 1` and `f ∥ (p − q)`, linear and angular
-momentum are both conserved.
+| Primitive          | Collides                                                                          |
+|--------------------|-----------------------------------------------------------------------------------|
+| `particle_plane`   | collision vertices vs. static half-spaces                                         |
+| `particle_sphere`  | collision vertices vs. static spheres                                             |
+| `vertex_triangle`  | collision vertices vs. other objects' closed meshes (signed: BVH query plus ray-cast inside test) |
+| `edge_edge`        | surface edges vs. other objects' surface edges (sign from the adjacent faces' normals) |
+| self-contact       | vertices and edges vs. their own object's surface (opt-in, unsigned)              |
+
+`CollisionSystem(max_penetration=0.1, edge_edge=True, self_contact=False)`:
+
+- **Pair policy.** Mesh–mesh contact is symmetric: vertices of A meet faces of B and vertices of B meet
+  faces of A. Each crossing edge pair yields one record.
+- **Edge–edge** covers what vertex–triangle misses: two edges crossing between vertices, e.g. two bars laid
+  across each other. Closest points within 0.1% of an edge end are left to vertex–triangle contact.
+- **Self-contact** skips faces and edges that share a node with the query, so it needs a margin well below
+  the edge length. Its distances are unsigned, so it prevents crossings but cannot undo one.
+- **Cost.** One launch per primitive covers all objects. Each (vertex or edge, mesh) pair is first culled
+  by the mesh's bounding box, then queried against that mesh's BVH. With 125 small cubes this cut
+  detection from 7.6 ms to 2.5 ms per step. Most of what remains is refitting the 125 BVHs, which is
+  Python-side launch overhead.
+- **Buffer.** When detection overflows the buffer, the buffer grows and detection reruns, so contacts are
+  never dropped. The check costs one device sync per step.
+
+### Penalty contact and friction
+
+`PenaltyContact(stiffness, damping, thickness, friction=0.0)`:
+
+- **Normal:** `f_n = max(0, k·d − c·v_n)` with `d = thickness − gap`. `v_n < 0` while approaching, so
+  damping adds repulsion; while separating it only reduces the force, and the clamp keeps it from ever
+  attracting.
+- **Friction:** Coulomb, `|f_t| ≤ μ f_n`, opposing the tangential relative velocity predicted for the end of
+  the step from all other forces. The force is capped at what stops that motion, so contacts stick exactly
+  (a sliding particle stops at `v²/2μg` and stays) without adding a stiffness limit on `dt`. When several
+  contacts share a node, its mass is split among them so their combined friction cannot overshoot.
+- **Angular momentum.** Vertex–triangle normal forces lie along `p − q`, so they also conserve angular
+  momentum. Edge–edge normals and friction forces act at a separation of up to `thickness`, which leaves
+  a residual torque of order `thickness × f`.
 
 ## Extending
 
@@ -122,10 +160,10 @@ momentum are both conserved.
 - **New material:** write a `@wp.func` `(F, mu, lam) -> P` and a class exposing it as `stress`, like
   `StableNeoHookean`. `TetFEM` compiles one kernel per stress function.
 - **New contact model:** subclass `ContactModel`, set `margin` (the detection distance), and implement
-  `apply(world, contacts)`. XPBD would project positions and a barrier would use `gap` directly. Objects
-  and detection stay unchanged.
-- **New primitive:** write a kernel that calls `add_contact(...)`, call it from
-  `CollisionSystem.detect`, and grow the buffer capacity in `build`.
+  `apply(world, contacts)` over the generic records. XPBD would project positions and a barrier would use
+  `gap` directly. Objects and detection stay unchanged.
+- **New primitive:** write a kernel that calls `add_contact(contacts, nodes, weights, normal, gap)` and
+  call it from `CollisionSystem._run`. The buffer grows on its own.
 - **New integrator:** any object with `step(world)`. The global arrays are all it needs.
 
 ## Choosing parameters
@@ -136,17 +174,21 @@ rules, with `m` the smallest node mass:
 - contact stiffness: `dt < ~sqrt(m / k)`, where k grows when several contacts load one node
 - contact damping: `c · dt / m < ~1`. Too much damping on light nodes blows up.
 - FEM: `dt < ~h_min / sqrt((λ + 2μ) / ρ)`
+- penalty contacts act only within `thickness` of touching (edge–edge also only within `thickness` past
+  crossing), so `k` must stop the fastest impact within that distance. Two crossing bars of 1 kg with
+  `k = 2e4` hold at 1 m/s but tunnel at 2 m/s.
 
 The examples use `dt = 1e-3` for particles and `2e-4` for the ~20 cm soft cubes.
 
 ## Limitations (by design, for now)
 
-- **No friction.** Objects slide freely. A body resting off-center on another soft body slides off because
-  the support tilts, and stacks are marginal. Friction is the natural next contact feature.
-- No self-contact, no particle–particle contact, no edge–edge contact, no CCD. Vertex–triangle contact
-  can miss a sharp edge poking through a face between vertices.
-- Vertices deeper than `CollisionSystem(max_penetration=0.1)` inside another mesh are not pushed out.
+- One friction coefficient per contact model; no per-object materials yet.
+- No particle–particle contact and no CCD, so fast thin features can tunnel (see above).
+- Vertices deeper than `max_penetration` inside another mesh are not pushed out. Edge–edge pairs that have
+  crossed by more than the margin are left to vertex–triangle contact.
 - Closed, outward-wound meshes are assumed for inside/outside classification.
+- The per-step overflow check is a host sync, which a future CUDA-graph step would replace with a
+  device-side flag.
 
 ## Layout
 
@@ -155,9 +197,10 @@ deformkit/
   core/          state.py  object.py  world.py  backend.py
   objects/       particle.py  spring.py  tet_fem.py
   materials/     spring.py  elasticity.py
-  collision/     geometry.py  contact.py  detection.py  particle_plane.py  particle_sphere.py  vertex_triangle.py
+  collision/     geometry.py  contact.py  penalty.py  detection.py  surface.py  distance.py
+                 particle_plane.py  particle_sphere.py  vertex_triangle.py  edge_edge.py
   integrators/   semi_implicit.py
   utils/         mesh.py  render.py
-examples/        particles_on_plane.py  spring_cube_drop.py  soft_cube_drop.py  two_soft_objects.py
-tests/           test_springs.py  test_contact.py  test_fem.py
+examples/        particles_on_plane.py  spring_cube_drop.py  soft_cube_drop.py  two_soft_objects.py  soft_stack.py
+tests/           test_springs.py  test_fem.py  test_contact.py  test_friction.py  test_world.py
 ```

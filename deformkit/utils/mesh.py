@@ -57,6 +57,12 @@ def rotate(points, axis, angle, center=None):
     return ((points - c) @ R.T + c).astype(np.float32)
 
 
+def remove_unused_vertices(vertices, elements):
+    """Drop vertices no element references; returns (vertices, reindexed elements)."""
+    used, inverse = np.unique(np.asarray(elements), return_inverse=True)
+    return np.asarray(vertices)[used], inverse.reshape(np.shape(elements)).astype(np.int32)
+
+
 def tet_signed_volumes(vertices, tets):
     p = vertices[tets]
     return np.einsum("ij,ij->i", np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0]) / 6.0
@@ -78,6 +84,35 @@ def boundary_triangles(tets):
     keys = [tuple(sorted(f)) for f in faces.tolist()]
     count = Counter(keys)
     return np.array([f for f, key in zip(faces, keys) if count[key] == 1], dtype=np.int32)
+
+
+def triangle_neighbors(triangles):
+    """[T, 3] index of the triangle across edge k = (t[k], t[k+1]), or -1 on an open boundary."""
+    neighbors = -np.ones((len(triangles), 3), dtype=np.int32)
+    open_edges = {}
+    for t, tri in enumerate(np.asarray(triangles).tolist()):
+        for k in range(3):
+            a, b = tri[k], tri[(k + 1) % 3]
+            key = (min(a, b), max(a, b))
+            if key in open_edges:
+                s, j = open_edges.pop(key)
+                neighbors[t, k], neighbors[s, j] = s, t
+            else:
+                open_edges[key] = (t, k)
+    return neighbors
+
+
+def triangle_edges(triangles):
+    """Unique edges of a triangle mesh and their adjacent faces.
+
+    Returns (edges [E, 2], faces [E, 2]); faces[:, 1] is -1 on an open boundary.
+    """
+    triangles = np.asarray(triangles)
+    neighbors = triangle_neighbors(triangles)
+    t, k = np.nonzero((neighbors < 0) | (neighbors > np.arange(len(triangles))[:, None]))
+    edges = np.stack([triangles[t, k], triangles[t, (k + 1) % 3]], axis=1)
+    faces = np.stack([t, neighbors[t, k]], axis=1)
+    return edges.astype(np.int32), faces.astype(np.int32)
 
 
 def tet_edges(tets):

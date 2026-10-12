@@ -1,6 +1,7 @@
 import warp as wp
 
-from deformkit.collision.contact import CollisionVertices, ContactData, add_contact
+from deformkit.collision.contact import ContactData, static_contact
+from deformkit.collision.surface import CollisionVertices
 
 
 @wp.kernel
@@ -18,7 +19,7 @@ def particle_plane_kernel(
     # plane n^T x = h: signed distance n^T x - h, minus the particle radius
     gap = wp.dot(n, x[vi]) - plane_offset[p] - verts.radius[i]
     if gap < margin:
-        add_contact(contacts, vi, wp.vec3i(-1, -1, -1), wp.vec3(0.0), n, gap)
+        static_contact(contacts, vi, n, gap)
 
 
 def detect_particle_plane(x, verts, plane_normal, plane_offset, margin, contacts):

@@ -1,9 +1,9 @@
 import numpy as np
 import warp as wp
 
-from deformkit.collision.contact import PenaltyContact
 from deformkit.collision.detection import CollisionSystem
 from deformkit.collision.geometry import Plane, Sphere
+from deformkit.collision.penalty import PenaltyContact
 from deformkit.core.backend import get_device, to_int
 from deformkit.core.state import State
 from deformkit.integrators.semi_implicit import SemiImplicitEuler

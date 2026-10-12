@@ -1,8 +1,9 @@
 """DeformKit: a small GPU deformable-body simulation kit built on NVIDIA Warp."""
 
-from deformkit.collision.contact import ContactModel, Contacts, PenaltyContact
+from deformkit.collision.contact import ContactModel, Contacts
 from deformkit.collision.detection import CollisionSystem
 from deformkit.collision.geometry import Plane, Points, Sphere, TriangleMesh
+from deformkit.collision.penalty import PenaltyContact
 from deformkit.core.object import SimObject
 from deformkit.core.state import State
 from deformkit.core.world import World

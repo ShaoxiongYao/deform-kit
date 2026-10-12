@@ -1,6 +1,6 @@
 [project]
 name = "deformkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small, extensible GPU deformable-body simulation kit built on NVIDIA Warp."
 readme = "README.md"
 license = "MIT"
@@ -40,3 +40,5 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+# Warp kernels need typed constructors such as int(0) for loop-carried variables
+ignore = ["UP018"]
